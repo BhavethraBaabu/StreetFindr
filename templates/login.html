@@ -1,0 +1,20 @@
+<!-- templates/login.html -->
+{% extends "base.html" %}
+{% block content %}
+  <h2>Log in</h2>
+
+  <!-- your existing username/password form (optional) -->
+  <form method="post" action="{{ url_for('login') }}">
+    <input name="username" placeholder="username" required>
+    <input name="password" placeholder="password" type="password" required>
+    <button type="submit">Log in</button>
+  </form>
+
+  <hr>
+
+  <!-- Google sign-in -->
+  <a href="{{ url_for('login_google') }}" style="display:inline-flex;align-items:center;padding:8px 12px;border:1px solid #ddd;border-radius:6px;text-decoration:none;">
+    <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="Google" style="height:18px;margin-right:8px;">
+    Sign in with Google
+  </a>
+{% endblock %}

@@ -3,14 +3,23 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user, UserMixin
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
+from authlib.integrations.flask_client import OAuth
+from urllib.parse import urlparse, urljoin
+from dotenv import load_dotenv
 import os
 import json
 
-# Configuration
+# ---------------------------------------------------------------------
+# Config & env
+# ---------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'static', 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# load .env (if present) so environment variables populate in development
+load_dotenv()
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
@@ -18,10 +27,26 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(BASE_DIR, 's
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
+# optional: limit upload size (8 MB)
+app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024
+
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
+
+# Authlib (Google OAuth)
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
+GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET')
+
+oauth = OAuth(app)
+oauth.register(
+    name='google',
+    client_id=GOOGLE_CLIENT_ID,
+    client_secret=GOOGLE_CLIENT_SECRET,
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={'scope': 'openid email profile'}
+)
 
 # ---------------------------------------------------------------------
 # MODELS
@@ -30,10 +55,15 @@ login_manager.login_view = 'login'
 class User(db.Model, UserMixin):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    password = db.Column(db.String(200), nullable=False)  # plaintext for demo ONLY
+    # allow null for OAuth-only accounts
+    password = db.Column(db.String(200), nullable=True)
+    email = db.Column(db.String(200), unique=True, nullable=True)
+    google_id = db.Column(db.String(200), unique=True, nullable=True)
     is_vendor = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    def __repr__(self):
+        return f"<User {self.username}>"
 
 class Vendor(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -49,7 +79,6 @@ class Vendor(db.Model):
 
     owner = db.relationship('User', backref='vendors')
 
-
 class Event(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(200), nullable=False)
@@ -63,7 +92,6 @@ class Event(db.Model):
 
     vendor = db.relationship('Vendor', backref='events')
 
-
 class Review(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
@@ -76,11 +104,94 @@ class Review(db.Model):
     user = db.relationship('User')
     vendor = db.relationship('Vendor', backref='reviews')
 
-
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
 
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+def is_safe_redirect_url(target):
+    """
+    Prevent open redirects: ensure redirect stays on same host.
+    """
+    host_url = urlparse(request.host_url)
+    redirect_url = urlparse(urljoin(request.host_url, target))
+    return redirect_url.scheme in ('http', 'https') and host_url.netloc == redirect_url.netloc
+
+def allowed_file(filename):
+    ALLOWED_EXT = {'png', 'jpg', 'jpeg', 'gif'}
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXT
+
+# ---------------------------------------------------------------------
+# OAuth routes (Google)
+# ---------------------------------------------------------------------
+
+@app.route('/login/google')
+def login_google():
+    redirect_uri = url_for('auth_google', _external=True)
+    return oauth.google.authorize_redirect(redirect_uri)
+
+@app.route('/auth/google')
+def auth_google():
+    # exchange code for token and validate id_token
+    token = oauth.google.authorize_access_token()
+    # Authlib: parse and validate id_token using provider metadata
+    userinfo = None
+    try:
+        userinfo = oauth.google.parse_id_token(token)
+    except Exception:
+        # fallback: some setups may use userinfo endpoint
+        try:
+            resp = oauth.google.get('userinfo')
+            userinfo = resp.json()
+        except Exception:
+            userinfo = None
+
+    if not userinfo:
+        flash('Failed to fetch user info from Google', 'danger')
+        return redirect(url_for('login'))
+
+    google_id = userinfo.get('sub')
+    email = userinfo.get('email')
+    email_verified = userinfo.get('email_verified', False)
+    name = userinfo.get('name') or (email.split('@')[0] if email else 'googleuser')
+
+    # It's recommended to require verified email
+    if email and not email_verified:
+        flash('Google account email is not verified', 'danger')
+        return redirect(url_for('login'))
+
+    # Find existing user by google_id or email
+    user = None
+    if google_id:
+        user = User.query.filter_by(google_id=google_id).first()
+    if not user and email:
+        user = User.query.filter_by(email=email).first()
+
+    if user:
+        # link google_id if it wasn't set before
+        if not user.google_id and google_id:
+            user.google_id = google_id
+            db.session.commit()
+    else:
+        # create a new user
+        base_username = (name or (email.split('@')[0] if email else 'googleuser')).strip()
+        username = base_username
+        i = 1
+        while User.query.filter_by(username=username).first():
+            username = f"{base_username}{i}"
+            i += 1
+        user = User(username=username, password=None, email=email, google_id=google_id)
+        db.session.add(user)
+        db.session.commit()
+
+    login_user(user)
+    next_url = request.args.get('next') or url_for('index')
+    if not is_safe_redirect_url(next_url):
+        next_url = url_for('index')
+    return redirect(next_url)
 
 # ---------------------------------------------------------------------
 # ROUTES — Pages
@@ -90,47 +201,44 @@ def load_user(user_id):
 def index():
     return render_template('index.html')
 
-
 @app.route('/discover')
 def discover():
     return render_template('discover.html')
-
 
 @app.route('/vendor/<int:vendor_id>')
 def vendor_page(vendor_id):
     v = Vendor.query.get_or_404(vendor_id)
     return render_template('vendor.html', vendor=v)
 
-
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        username = request.form['username']
+        username = request.form['username'].strip()
         password = request.form['password']
         if User.query.filter_by(username=username).first():
-            flash('Username already exists')
+            flash('Username already exists', 'danger')
             return redirect(url_for('register'))
-        u = User(username=username, password=password)
+
+        hashed = generate_password_hash(password)
+        u = User(username=username, password=hashed)
         db.session.add(u)
         db.session.commit()
         login_user(u)
         return redirect(url_for('index'))
     return render_template('register.html')
 
-
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form['username']
+        username = request.form['username'].strip()
         password = request.form['password']
-        u = User.query.filter_by(username=username, password=password).first()
-        if not u:
-            flash('Invalid credentials')
+        u = User.query.filter_by(username=username).first()
+        if not u or not u.password or not check_password_hash(u.password, password):
+            flash('Invalid credentials', 'danger')
             return redirect(url_for('login'))
         login_user(u)
         return redirect(url_for('index'))
     return render_template('login.html')
-
 
 @app.route('/logout')
 @login_required
@@ -138,6 +246,9 @@ def logout():
     logout_user()
     return redirect(url_for('index'))
 
+# ---------------------------------------------------------------------
+# VENDOR & EVENT CREATION
+# ---------------------------------------------------------------------
 
 @app.route('/vendor/create', methods=['GET', 'POST'])
 @login_required
@@ -150,7 +261,7 @@ def vendor_create():
         addr = request.form.get('address')
         file = request.files.get('image')
         filename = None
-        if file:
+        if file and allowed_file(file.filename):
             filename = secure_filename(file.filename)
             file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
         v = Vendor(
@@ -166,7 +277,6 @@ def vendor_create():
         db.session.commit()
         return redirect(url_for('vendor_page', vendor_id=v.id))
     return render_template('vendor_form.html')
-
 
 @app.route('/event/create', methods=['POST'])
 @login_required
@@ -190,7 +300,6 @@ def event_create():
     db.session.add(e)
     db.session.commit()
     return redirect(url_for('index'))
-
 
 # ---------------------------------------------------------------------
 # API ENDPOINTS
@@ -224,7 +333,6 @@ def api_vendors():
         })
     return jsonify(out)
 
-
 @app.route('/api/events')
 def api_events():
     events = Event.query.filter(
@@ -243,18 +351,15 @@ def api_events():
         })
     return jsonify(out)
 
-
 @app.route('/uploads/<path:filename>')
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
 
 # ---------------------------------------------------------------------
 # SIMPLE NOTIFICATIONS STREAM (SSE)
 # ---------------------------------------------------------------------
 
 _subscribers = []
-
 
 @app.route('/stream/notifications')
 def stream_notifications():
@@ -265,13 +370,12 @@ def stream_notifications():
             while True:
                 if q:
                     data = q.pop(0)
-                    yield f"data: {json.dumps(data)}\\n\\n"
+                    yield f"data: {json.dumps(data)}\n\n"
                 else:
-                    yield ': heartbeat\\n\\n'
+                    yield ': heartbeat\n\n'
         except GeneratorExit:
             _subscribers.remove(q)
     return Response(gen(), mimetype='text/event-stream')
-
 
 @app.route('/admin/broadcast', methods=['POST'])
 def admin_broadcast():
@@ -279,7 +383,6 @@ def admin_broadcast():
     for q in list(_subscribers):
         q.append(data)
     return jsonify({'sent': True})
-
 
 # ---------------------------------------------------------------------
 # REVIEWS
@@ -292,7 +395,7 @@ def post_review(vendor_id):
     text = request.form.get('text')
     file = request.files.get('image')
     filename = None
-    if file:
+    if file and allowed_file(file.filename):
         filename = secure_filename(file.filename)
         file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
     r = Review(
@@ -306,10 +409,12 @@ def post_review(vendor_id):
     db.session.commit()
     return redirect(url_for('vendor_page', vendor_id=vendor_id))
 
-
-
+# ---------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------
 
 if __name__ == '__main__':
+    # For dev: create DB tables if missing (use migrations for production)
     with app.app_context():
         db.create_all()
     app.run(debug=True, host='0.0.0.0', port=5000)

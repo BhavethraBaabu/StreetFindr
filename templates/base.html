@@ -4,20 +4,61 @@
     <meta charset="utf-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1"/>
     <title>StreetFindr</title>
+
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+
     <style>
       body { font-family: system-ui, Arial, sans-serif; margin: 0; }
-      header { background: #111; color: white; padding: 12px; }
-      a { color: #0077ff; text-decoration: none; }
+      header {
+        background: #111;
+        color: white;
+        padding: 12px 20px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      header a {
+        color: #fff;
+        text-decoration: none;
+        margin-left: 16px;
+        font-weight: 500;
+      }
       .container { padding: 16px; }
     </style>
   </head>
+
   <body>
+
+    <!-- Top Navigation Bar -->
     <header>
-      <h1>StreetFindr</h1>
+      <!-- Left side: App name -->
+      <div>
+        <a href="{{ url_for('index') }}" style="color:white; font-size: 1.4rem; font-weight: bold;">
+          StreetFindr
+        </a>
+      </div>
+
+      <!-- Right side: Login status -->
+      <div>
+        {% if current_user.is_authenticated %}
+          <span style="margin-right: 12px;">
+            {{ current_user.username }}
+            {% if current_user.email %}
+              ({{ current_user.email }})
+            {% endif %}
+          </span>
+          <a href="{{ url_for('logout') }}">Logout</a>
+        {% else %}
+          <a href="{{ url_for('login') }}">Login</a>
+          <a href="{{ url_for('register') }}">Register</a>
+        {% endif %}
+      </div>
     </header>
+
+    <!-- Main Content -->
     <main class="container">
       {% block content %}{% endblock %}
     </main>
+
   </body>
 </html>
