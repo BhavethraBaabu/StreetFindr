@@ -1,0 +1,30 @@
+{% extends 'base.html' %}
+
+{% block content %}
+<h2>Welcome to StreetFindr</h2>
+<p>Explore local vendors and events near you!</p>
+
+<div id="map" style="height: 60vh;"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const map = L.map('map').setView([40.7128, -74.0060], 13);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+  }).addTo(map);
+
+  async function loadVendors(){
+    const bounds = map.getBounds();
+    const url = `/api/vendors?minlat=${bounds.getSouth()}&maxlat=${bounds.getNorth()}&minlng=${bounds.getWest()}&maxlng=${bounds.getEast()}`;
+    const res = await fetch(url);
+    const vendors = await res.json();
+    vendors.forEach(v => {
+      const marker = L.marker([v.latitude, v.longitude]).addTo(map);
+      marker.bindPopup(`<strong>${v.name}</strong><p>${v.description || ''}</p><a href='/vendor/${v.id}'>View</a>`);
+    });
+  }
+
+  map.on('moveend', loadVendors);
+  loadVendors();
+</script>
+{% endblock %}
